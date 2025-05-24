@@ -7,28 +7,100 @@ import logging
 import aiohttp
 from bs4 import BeautifulSoup
 from requests_html import AsyncHTMLSession
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode as urllib_urlencode # Renamed to avoid conflict
 import pandas as pd
 import re
 from datetime import datetime
+from typing import Dict, List, Callable # Added type hints
+import json # Added for JSON output
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- SCRAPER CONFIGURATION ---
-# This dictionary centralizes all configuration for the scrapers,
-# including base URLs, search terms, request headers, and pagination limits.
+# This dictionary centralizes all configuration for the scrapers.
+# It includes global settings like request headers and default search terms,
+# and a list of site-specific configurations under the "SITES" key.
 SCRAPER_CONFIG = {
-    "WEWORKREMOTELY_BASE_URL": "https://weworkremotely.com/remote-jobs/search", # Base URL for WWR job searches
-    "WEWORKREMOTELY_SEARCH_TERM": "python", # Search term for WWR
-    "WEWORKREMOTELY_MAX_PAGES": 3, # Max number of pages to scrape from WWR for the search term
-    "JOBPRESSO_BASE_URL": "https://jobspresso.co/jobs/", # Base URL for Jobspresso job searches
-    "JOBPRESSO_SEARCH_TERM": "python", # Search term for Jobspresso
     "REQUEST_HEADERS": { # Standard headers to use for all HTTP requests
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    },
+    "DEFAULT_SEARCH_TERM": "python", # Default search term to use if not specified by a site
+    "INCREMENTAL_SCRAPING_ENABLED": True, # Flag to enable/disable incremental scraping
+    "SITES": [
+        {
+            "name": "WeWorkRemotely",
+            "base_url": "https://weworkremotely.com/remote-jobs/search",
+            "search_term_param": "term", 
+            "search_term_default": "python", 
+            "page_param": "page", 
+            "max_pages": 3, 
+            "job_listing_selector": "section.jobs ul li", 
+            "title_selector": "span.title", 
+            "company_selector": "span.company", 
+            "link_selector": "a[href*='/remote-jobs/']", # Selects 'a' tags whose href contains '/remote-jobs/'
+            "link_attribute": "href", 
+            "link_base_url": "https://weworkremotely.com", 
+            "date_selector": "span.date", # Selector for the date posted
+            "region_selector": "span.region", # Selector for the region
+            "ad_detection_rules": [
+                {"type": "class", "value": "ad"}, 
+                {"type": "text", "value": "sponsored"} 
+            ],
+            "enabled": True 
+        },
+        {
+            "name": "Jobspresso",
+            "base_url": "https://jobspresso.co/jobs/",
+            "search_term_param": "search_keywords",
+            "search_term_default": "python",
+            "page_param": None, # Jobspresso search seems to be single-page or JS-paginated without URL param
+            "max_pages": 1, 
+            "job_listing_selector": "div.job-listing", 
+            "title_selector": "h3.job-listing__title", 
+            "company_selector": "span.job-listing__company", 
+            "link_selector": "a.job-listing__title-link", 
+            "link_attribute": "href",
+            "link_base_url": None, # Jobspresso links are absolute
+            "date_selector": "span.job-listing__date", # Selector for the date posted
+            "region_selector": None, # Region is not consistently available or easily selectable
+            "ad_detection_rules": [ # Generic rules, can be refined if Jobspresso has specific ad patterns
+                {"type": "class", "value": "ad"},
+                {"type": "text", "value": "sponsored"}
+            ],
+            "enabled": True
+        }
+    ]
 }
 # --- END SCRAPER CONFIGURATION ---
+
+SEEN_JOBS_FILE = "seen_jobs.txt" # File to store URLs of already seen jobs
+
+# --- Helper Functions for Incremental Scraping ---
+def load_seen_job_urls(filename: str) -> set:
+    seen_urls = set()
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                seen_urls.add(line.strip())
+        logging.info(f"Loaded {len(seen_urls)} seen job URLs from {filename}")
+    except FileNotFoundError:
+        logging.info(f"{filename} not found. Will be created on first successful run with new jobs.")
+    except Exception as e:
+        logging.error(f"Error loading seen job URLs from {filename}: {e}")
+    return seen_urls
+
+def save_job_urls(filename: str, job_urls: set):
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            for url in job_urls:
+                f.write(url + "\n")
+        logging.info(f"Saved {len(job_urls)} job URLs to {filename}")
+    except Exception as e:
+        logging.error(f"Error saving job URLs to {filename}: {e}")
+
+# --- END Helper Functions for Incremental Scraping ---
+
 
 # Helper function for dynamic sessions
 def get_dynamic_session():
@@ -140,233 +212,214 @@ async def fetch_page_content(url: str, static_session: aiohttp.ClientSession, dy
     logging.error(f"All fetch attempts failed for {url}.")
     return ""
 
-# Function to identify ad containers based on class or text content
-def is_ad_container(element) -> bool:
-    '''
-    Checks if a given BeautifulSoup element is likely an advertisement container.
-    It checks for common keywords like "ad" in class names or "sponsored" in the text.
-    '''
-    # Check for 'ad' in class names
-    classes = element.get("class", [])
-    if any("ad" in cls.lower() for cls in classes):
-        logging.debug(f"Ad detected by class in element: {element.name} with classes {classes}")
-        return True
-    # Check for 'sponsored' in text content (recursively)
-    if element.find(string=lambda t: t and "sponsored" in t.lower()):
-        logging.debug(f"Ad detected by text 'sponsored' in element: {element.name}")
-        return True
+# Function to identify ad containers based on dynamic rules
+def is_ad_container(element, rules: List[Dict]) -> bool:
+    """
+    Checks if a given BeautifulSoup element is likely an advertisement container
+    based on a list of rules.
+    Each rule in the list is a dictionary specifying a "type" (e.g., "class", "text")
+    and a "value" to check for.
+
+    Args:
+        element: The BeautifulSoup element to check.
+        rules: A list of dictionaries, where each dictionary is an ad detection rule.
+               Example: [{"type": "class", "value": "ad"}, {"type": "text", "value": "sponsored"}]
+
+    Returns:
+        True if the element matches any of the ad detection rules, False otherwise.
+    """
+    if not rules:
+        return False
+        
+    for rule in rules:
+        rule_type = rule.get("type")
+        rule_value = rule.get("value")
+        if not rule_type or not rule_value:
+            logging.warning(f"Skipping invalid ad detection rule: {rule}")
+            continue
+
+        if rule_type == "class":
+            classes = element.get("class", [])
+            if any(rule_value.lower() in cls.lower() for cls in classes):
+                logging.debug(f"Ad detected by class rule '{rule_value}' in element: {element.name} with classes {classes}")
+                return True
+        elif rule_type == "text":
+            if element.find(string=lambda t: t and rule_value.lower() in t.lower()):
+                logging.debug(f"Ad detected by text rule '{rule_value}' in element: {element.name}")
+                return True
+        else:
+            logging.warning(f"Unknown ad detection rule type: {rule_type}")
+            
     return False
 
-async def scrape_weworkremotely(static_session):
+async def scrape_site(
+    site_config: Dict,
+    search_term: str,
+    static_session: aiohttp.ClientSession,
+    dynamic_session_factory: Callable
+) -> List[Dict]:
     """
-    Scrapes job listings for a configured search term from We Work Remotely.
+    Generic function to scrape job listings from a single site based on its configuration.
 
-    Flow:
-    1. Constructs search URLs for each page up to `WEWORKREMOTELY_MAX_PAGES`.
-    2. Fetches page content using `fetch_page_content` (static first, then dynamic fallback).
-    3. Parses HTML using BeautifulSoup.
-    4. Extracts job details (title, company, URL, date, region) from `<li>` elements.
-       - Uses specific CSS selectors like 'span.title', 'span.company'.
-       - Job URLs are resolved to be absolute.
-    5. If initial fetch yields no listings, it attempts a `force_dynamic` fetch for the page.
-    6. Appends extracted job data to a list.
-    7. No site-specific deduplication is performed here; it's handled globally in `main`.
+    Args:
+        site_config: Configuration dictionary for the site.
+        search_term: The job search term.
+        static_session: aiohttp session for static requests.
+        dynamic_session_factory: Callable that returns an AsyncHTMLSession.
+
+    Returns:
+        A list of unique job dictionaries found on the site.
     """
-    base_url = SCRAPER_CONFIG["WEWORKREMOTELY_BASE_URL"]
-    search_term = SCRAPER_CONFIG["WEWORKREMOTELY_SEARCH_TERM"]
-    max_pages = SCRAPER_CONFIG["WEWORKREMOTELY_MAX_PAGES"]
+    all_jobs_for_site = []
     request_headers = SCRAPER_CONFIG["REQUEST_HEADERS"]
-    all_jobs = []
+    base_url = site_config["base_url"]
 
-    for page_num in range(1, max_pages + 1):
-        page_url = f"{base_url}?term={search_term}&page={page_num}"
-        logging.info(f"Scraping WeWorkRemotely: {search_term} - Page {page_num} from {page_url}")
+    for page_num in range(1, site_config["max_pages"] + 1):
+        params = {site_config["search_term_param"]: search_term}
+        if site_config.get("page_param") and page_num > 1: # Add page param only if it exists and page > 1
+            params[site_config["page_param"]] = page_num
         
-        html_content = await fetch_page_content(page_url, static_session, get_dynamic_session, request_headers, initial_fetch_type='static')
+        query_string = urllib_urlencode(params)
+        # urljoin can handle if base_url already has query params, but it's cleaner if not.
+        # Assuming base_url in config is clean (no trailing ? or params)
+        page_url = f"{base_url}?{query_string}" if query_string else base_url 
+        # If base_url for search doesn't use query params (e.g. https://site.com/search/term/page/1)
+        # this URL construction will need to be more flexible based on config.
+        # For now, assuming query parameter based search and pagination.
 
-        if not html_content: # Enhanced error handling
-            logging.warning(f"No HTML content fetched for URL: {page_url}. Skipping page.")
+        logging.info(f"Scraping {site_config['name']}: {search_term} - Page {page_num} from {page_url}")
+
+        html_content = await fetch_page_content(
+            page_url, static_session, dynamic_session_factory, request_headers, 
+            initial_fetch_type=site_config.get("initial_fetch_type", "static"), # Allow config override
+            force_dynamic=site_config.get("force_dynamic", False)
+        )
+
+        if not html_content:
+            logging.warning(f"No HTML content for {page_url} on {site_config['name']}. Skipping page.")
             continue
 
-        soup = BeautifulSoup(html_content, 'html.parser')
-    # Adjusted selector based on typical WWR search result structure.
-    # Jobs are usually in `<li>` elements within a `<ul>` inside a `<section class="jobs">`.
-        job_listings = soup.select('section.jobs ul li') 
+        soup = BeautifulSoup(html_content, "html.parser")
+        job_listings_elements = soup.select(site_config["job_listing_selector"])
+        logging.info(f"Found {len(job_listings_elements)} potential job listings on {page_url}.")
 
-        if not job_listings: 
-        # If static fetch (or its initial dynamic fallback) didn't find listings,
-        # try forcing a dynamic fetch, as content might be JS-rendered.
-            logging.info(f"No job listings found for {page_url} with initial strategy. Trying with force_dynamic=True.")
-            html_content = await fetch_page_content(page_url, static_session, get_dynamic_session, request_headers, force_dynamic=True)
-            if html_content:
-                soup = BeautifulSoup(html_content, 'html.parser')
-                job_listings = soup.select('section.jobs ul li') # Re-select after dynamic fetch
-            elif not job_listings: 
-                logging.warning(f"force_dynamic fetch also failed for {page_url} or returned no listings. Skipping page.")
-                continue
+        if not job_listings_elements and site_config["max_pages"] > 1 : # If no jobs on a results page, likely end of results for this site
+             logging.info(f"No job listings found on {page_url} for {site_config['name']}. This might be the last page of results.")
+             break
+
+
+        for job_elem in job_listings_elements:
+            try:
+                if is_ad_container(job_elem, site_config.get("ad_detection_rules", [])):
+                    logging.info(f"Skipping ad listing on {page_url} for site {site_config['name']}.")
+                    continue
+
+                title_elem = job_elem.select_one(site_config["title_selector"])
+                title = title_elem.get_text(strip=True) if title_elem else "N/A"
+
+                company_elem = job_elem.select_one(site_config["company_selector"])
+                company = company_elem.get_text(strip=True) if company_elem else "N/A"
+
+                link_elem = job_elem.select_one(site_config["link_selector"])
+                relative_url = link_elem.get(site_config["link_attribute"]) if link_elem else None
+                
+                if not relative_url:
+                    logging.warning(f"No link found for a job on {site_config['name']} using selector '{site_config['link_selector']}'. Skipping.")
+                    continue
+                
+                # Construct absolute URL. Use site's base_url if link_base_url is not specified.
+                effective_link_base = site_config.get("link_base_url") or base_url
+                absolute_url = urljoin(effective_link_base, relative_url)
+
+                date_elem = job_elem.select_one(site_config.get("date_selector", "")) # Handle if not defined
+                date_posted = date_elem.get_text(strip=True) if date_elem else "N/A"
+                
+                region_elem = job_elem.select_one(site_config.get("region_selector", "")) # Handle if not defined
+                region = region_elem.get_text(strip=True) if region_elem else "N/A"
+
+                if title == "N/A" and company == "N/A": # Skip if essential info is missing
+                    logging.debug(f"Skipping job on {site_config['name']} due to missing title and company. URL: {absolute_url}")
+                    continue
+
+                all_jobs_for_site.append({
+                    "source": site_config["name"],
+                    "title": title,
+                    "company": company,
+                    "url": absolute_url,
+                    "date_posted": date_posted,
+                    "region": region
+                })
+            except Exception as e:
+                logging.error(f"Error parsing a job listing for {site_config['name']} on {page_url}: {e}", exc_info=True)
+    
+    # Deduplication for the current site
+    if all_jobs_for_site:
+        logging.info(f"Deduplicating {len(all_jobs_for_site)} jobs from {site_config['name']} based on URL.")
+        unique_jobs = {job["url"]: job for job in all_jobs_for_site}
+        all_jobs_for_site = list(unique_jobs.values())
+        logging.info(f"Returning {len(all_jobs_for_site)} unique jobs from {site_config['name']}.")
         
-    if not job_listings: 
-        # If still no listings after trying dynamic, it might be the last page of results or an empty search.
-            logging.info(f"No job listings found on page {page_num} for {search_term} even after dynamic fetch. This might be the last page.")
-        break # Exit pagination loop if a page is genuinely empty.
-
-        logging.info(f"Found {len(job_listings)} job listings on page {page_num} for {search_term}.")
-
-        for job in job_listings:
-            # Skip if the listing is identified as an ad/sponsored content
-            if is_ad_container(job):
-                logging.info(f"Skipping a job listing on {page_url} because it was identified as an ad.")
-                continue
-
-            title_element = job.find('span', class_='title')
-            company_element = job.find('span', class_='company')
-            date_element = job.find('span', class_='date')
-            region_element = job.find('span', class_='region')
-            # WWR search result links are usually direct 'a' tags with href within the 'li'
-            job_url_element = job.find('a', href=re.compile(r'/remote-jobs/'))
-
-            if not (title_element and company_element and job_url_element and job_url_element.get('href')):
-                title_text = title_element.text.strip() if title_element else "None"
-                company_text = company_element.text.strip() if company_element else "None"
-                link_href = job_url_element.get('href') if job_url_element else "None"
-                logging.warning(f"Missing essential data for a job listing on {page_url}. Title: {title_text}, Company: {company_text}, Link: {link_href}. Skipping listing.")
-                continue
-
-            title = title_element.text.strip()
-            company = company_element.text.strip()
-    # Base URL for WWR job links is "https://weworkremotely.com", so urljoin is used for relative links.
-            job_url = urljoin("https://weworkremotely.com", job_url_element['href'])
-            date_posted = date_element.text.strip() if date_element else "N/A"
-            region = region_element.text.strip() if region_element else "N/A"
-            
-            all_jobs.append({
-                'title': title,
-                'company': company,
-                'url': job_url,
-                'source': 'WeWorkRemotely',
-                'date_posted': date_posted,
-                'region': region
-            })
-    
-    logging.info(f"Total jobs scraped from WeWorkRemotely for '{search_term}': {len(all_jobs)}")
-    return all_jobs
-
-async def scrape_jobspresso(static_session):
-    """
-    Scrapes job listings for a configured search term from Jobspresso.
-
-    Flow:
-    1. Constructs the search URL using the base URL and search term.
-    2. Fetches page content using `fetch_page_content` (static first, dynamic fallback).
-    3. Parses HTML using BeautifulSoup.
-    4. Extracts job details (title, company, URL, date) from `div.job-listing` elements.
-       - Uses specific CSS selectors like 'h3.job-listing__title'.
-       - Jobspresso links are typically absolute.
-    5. If initial fetch yields no listings, it attempts a `force_dynamic` fetch.
-    6. Appends extracted job data to a list.
-    7. Performs deduplication of jobs based on the job URL before returning.
-    """
-    base_url = SCRAPER_CONFIG["JOBPRESSO_BASE_URL"]
-    search_term = SCRAPER_CONFIG["JOBPRESSO_SEARCH_TERM"]
-    request_headers = SCRAPER_CONFIG["REQUEST_HEADERS"]
-    # Construct the URL for Jobspresso. Note: Jobspresso's search might be different,
-    # this is a common pattern. Adjust if their URL structure is different.
-    # Example: https://jobspresso.co/jobs/?search_keywords=python
-    # Or: https://jobspresso.co/remote-work/python/ (if it uses path segments for search)
-    # For this example, I'll use the query parameter style.
-    url = f"{base_url}?search_keywords={search_term}" 
-    # If Jobspresso uses a different structure like /remote-work/ for all jobs and then filters, 
-    # the original URL might be better: "https://jobspresso.co/remote-work/" and then hope the search term is a filter on that page
-    # For now, sticking to the provided structure with search term in query.
-    # Let's assume the task meant to use the search term for Jobspresso as well.
-    # Original URL from previous version: "https://jobspresso.co/remote-work/"
-    # Let's try to keep previous behavior if search term is empty, or use new one.
-    # The config has "JOBPRESSO_BASE_URL": "https://jobspresso.co/jobs/", which implies search.
-    
-    all_jobs = []
-    
-    logging.info(f"Scraping Jobspresso from {url} for term '{search_term}'")
-    
-    html_content = await fetch_page_content(url, static_session, get_dynamic_session, request_headers, initial_fetch_type='static')
-
-    if not html_content: # Enhanced error handling
-        logging.warning(f"No HTML content fetched for URL: {url}. Skipping page.")
-        return all_jobs
-
-    soup = BeautifulSoup(html_content, 'html.parser')
-    job_listings = soup.find_all('div', class_='job-listing') # Standard container for Jobspresso listings.
-
-    if not job_listings:
-        # If static fetch (or its initial dynamic fallback) didn't find listings,
-        # try forcing a dynamic fetch, as content might be JS-rendered.
-        logging.info(f"No job listings found for {url} with initial strategy. Trying with force_dynamic=True.")
-        html_content = await fetch_page_content(url, static_session, get_dynamic_session, request_headers, force_dynamic=True)
-        if html_content:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            job_listings = soup.find_all('div', class_='job-listing')
-        elif not job_listings: 
-            logging.warning(f"force_dynamic fetch also failed for {url} or returned no listings. Skipping Jobspresso.")
-            return all_jobs
-
-    logging.info(f"Found {len(job_listings)} job listings on Jobspresso for '{search_term}'.")
-
-    for job in job_listings:
-        title_element = job.find('h3', class_='job-listing__title')
-        company_element = job.find('span', class_='job-listing__company')
-        job_url_element = job.find('a', class_='job-listing__title-link') 
-        date_posted_element = job.find('span', class_='job-listing__date') 
-
-        if not (title_element and company_element and job_url_element and job_url_element.get('href')):
-            title_text = title_element.text.strip() if title_element else "None"
-            company_text = company_element.text.strip() if company_element else "None"
-            link_href = job_url_element.get('href') if job_url_element else "None"
-            logging.warning(f"Missing essential data for a job listing on {url} (term: {search_term}). Title: {title_text}, Company: {company_text}, Link: {link_href}. Skipping listing.")
-            continue
-            
-        title = title_element.text.strip()
-        company = company_element.text.strip()
-        job_url = job_url_element['href'] # Jobspresso links are usually absolute
-        date_posted = date_posted_element.text.strip() if date_posted_element else "N/A"
-        
-        all_jobs.append({
-            'title': title,
-            'company': company,
-            'url': job_url,
-            'source': 'Jobspresso',
-            'date_posted': date_posted,
-            'region': "N/A" # Jobspresso doesn't always specify region easily
-        })
-            
-    logging.info(f"Total jobs scraped from Jobspresso for '{search_term}': {len(all_jobs)}")
-    
-    if all_jobs: 
-        # Deduplicate jobs from Jobspresso based on their URL before returning.
-        # This is a site-specific deduplication step.
-        logging.info(f"Deduplicating {len(all_jobs)} jobs from Jobspresso based on URL.")
-        unique_jobs = {job["url"]: job for job in all_jobs}
-        all_jobs = list(unique_jobs.values())
-        logging.info(f"Returning {len(all_jobs)} unique jobs from Jobspresso.")
-    return all_jobs
+    return all_jobs_for_site
 
 async def main():
     """
     Main function to orchestrate the scraping process.
-    It initializes an aiohttp session, calls the scraper functions for each site,
-    combines the results, performs global deduplication, and saves the data to a CSV file.
+    It initializes an aiohttp session, iterates through configured sites,
+    calls the generic scrape_site function for each, combines the results,
+    filters for new jobs if incremental scraping is enabled,
+    performs global deduplication, and saves the data to CSV and JSON files.
     """
-    # Create a single aiohttp session to be reused for all static requests.
-    # Headers are now sourced from SCRAPER_CONFIG within individual scraper functions.
-    async with aiohttp.ClientSession() as static_session: 
-        # Run scrapers concurrently.
-        weworkremotely_jobs = await scrape_weworkremotely(static_session)
-        jobspresso_jobs = await scrape_jobspresso(static_session)
-
-    # Combine results from all scrapers.
-    all_jobs = weworkremotely_jobs + jobspresso_jobs
+    dynamic_session_factory = get_dynamic_session
+    all_scraped_jobs = []
     
-    if all_jobs:
+    seen_job_urls = set()
+    incremental_enabled = SCRAPER_CONFIG.get("INCREMENTAL_SCRAPING_ENABLED", False)
+
+    if incremental_enabled:
+        seen_job_urls = load_seen_job_urls(SEEN_JOBS_FILE)
+
+    async with aiohttp.ClientSession() as static_session:
+        for site_conf in SCRAPER_CONFIG["SITES"]:
+            if not site_conf.get("enabled", True):
+                logging.info(f"Skipping {site_conf['name']} as it is disabled in the configuration.")
+                continue
+
+            logging.info(f"Starting to scrape {site_conf['name']}...")
+            # Determine search term: site-specific default, then global default, then fallback "python"
+            search_term = site_conf.get("search_term_default", SCRAPER_CONFIG.get("DEFAULT_SEARCH_TERM", "python"))
+            
+            try:
+                jobs_from_site = await scrape_site(
+                    site_conf,
+                    search_term,
+                    static_session,
+                    dynamic_session_factory
+                )
+                logging.info(f"Found {len(jobs_from_site)} jobs from {site_conf['name']}.")
+                all_scraped_jobs.extend(jobs_from_site)
+            except Exception as e:
+                logging.error(f"Error scraping site {site_conf['name']}: {e}", exc_info=True)
+    
+    logging.info(f"Total jobs scraped from all sites before any filtering: {len(all_scraped_jobs)}")
+
+    if incremental_enabled:
+        current_run_job_urls = {job['url'] for job in all_scraped_jobs if job.get('url')}
+        new_jobs = [job for job in all_scraped_jobs if job.get('url') and job['url'] not in seen_job_urls]
+        
+        logging.info(f"Previously seen jobs: {len(seen_job_urls)}")
+        logging.info(f"Jobs scraped in this run: {len(current_run_job_urls)}")
+        logging.info(f"New jobs found: {len(new_jobs)}")
+        
+        all_scraped_jobs = new_jobs # Process only new jobs further
+        
+        updated_seen_urls = seen_job_urls.union(current_run_job_urls)
+        save_job_urls(SEEN_JOBS_FILE, updated_seen_urls)
+    else:
+        logging.info("Incremental scraping is disabled. Processing all scraped jobs.")
+
+    if all_scraped_jobs: # This will now be true only if there are new jobs (if incremental) or any jobs (if not incremental)
         # Create a Pandas DataFrame for easier data manipulation and CSV export.
-        df = pd.DataFrame(all_jobs)
+        df = pd.DataFrame(all_scraped_jobs)
         
         # --- Data cleaning and normalization ---
         df.replace('N/A', pd.NA, inplace=True) # Standardize N/A values to Pandas NA.
@@ -385,15 +438,32 @@ async def main():
         # Global deduplication: Remove duplicates based on job title and company name,
         # keeping the first occurrence. This helps if the same job is posted on multiple sites
         # or if site-specific deduplication was not exhaustive.
-        df.drop_duplicates(subset=['title', 'company'], keep='first', inplace=True)
+        # Note: Site-specific URL deduplication is already done in `scrape_site`.
+        df.drop_duplicates(subset=['title', 'company'], keep='first', inplace=True) # Global deduplication on remaining jobs
 
         # --- Save to CSV ---
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"job_listings_{timestamp}.csv"
-        df.to_csv(filename, index=False, encoding='utf-8')
-        logging.info(f"Saved {len(df)} unique job listings to {filename}")
+        csv_filename = f"job_listings_{timestamp}.csv"
+        df.to_csv(csv_filename, index=False, encoding='utf-8')
+        logging.info(f"Saved {len(df)} unique job listings to {csv_filename} after global deduplication.")
+
+        # --- Save to JSON file ---
+        final_jobs_for_json = df.to_dict(orient='records')
+        json_output_filename = "jobs.json" # Static filename as per prompt
+        try:
+            with open(json_output_filename, "w", encoding="utf-8") as f:
+                json.dump(final_jobs_for_json, f, ensure_ascii=False, indent=4)
+            logging.info(f"Successfully saved {len(final_jobs_for_json)} jobs to {json_output_filename}")
+        except IOError as e:
+            logging.error(f"Error saving jobs to JSON file {json_output_filename}: {e}")
+        except TypeError as e:
+            logging.error(f"TypeError while serializing jobs to JSON (check data types): {e}")
+
     else:
-        logging.info("No job listings were scraped.")
+        if incremental_enabled:
+            logging.info("No new job listings to save.")
+        else:
+            logging.info("No job listings were scraped from any site.")
 
 # Standard Python idiom: defines the entry point for when the script is executed directly.
 if __name__ == "__main__":
